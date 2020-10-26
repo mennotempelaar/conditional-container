@@ -2,6 +2,8 @@
 
 namespace DigitalCreative\ConditionalContainer;
 
+use \Benjacho\BelongsToManyField\BelongsToManyField;
+use Closure;
 use Illuminate\Http\Resources\MergeValue;
 use Illuminate\Support\Collection;
 use Laravel\Nova\Contracts\RelatableField;
@@ -21,6 +23,10 @@ use Laravel\Nova\Http\Controllers\UpdateFieldController;
 use Laravel\Nova\Http\Requests\NovaRequest;
 use Laravel\Nova\Panel;
 use Laravel\Nova\Resource;
+use NovaAttachMany\AttachMany;
+use Whitecube\NovaFlexibleContent\Flexible;
+use Whitecube\NovaFlexibleContent\Layouts\Collection as LayoutCollection;
+use Whitecube\NovaFlexibleContent\Layouts\Layout;
 
 trait HasConditionalContainer
 {
@@ -31,12 +37,17 @@ trait HasConditionalContainer
      * @param NovaRequest $request
      * @return array
      */
-    public function availablePanelsForDetail(NovaRequest $request, Resource $resource)
-    {
+    public function availablePanelsForDetail(
+        NovaRequest $request,
+        Resource $resource
+    ) {
         $panels = parent::availablePanelsForDetail($request, $resource);
         $fields = parent::availableFields($request);
 
-        return $this->mergePanels($panels, $this->findAllActiveContainers($fields, $this));
+        return $this->mergePanels(
+            $panels,
+            $this->findAllActiveContainers($fields, $this)
+        );
     }
 
     /**
@@ -61,8 +72,10 @@ trait HasConditionalContainer
      *
      * @return array
      */
-    public function availablePanelsForUpdate(NovaRequest $request, Resource $resource = null)
-    {
+    public function availablePanelsForUpdate(
+        NovaRequest $request,
+        Resource $resource = null
+    ) {
         $panels = parent::availablePanelsForUpdate($request, $resource);
         $fields = parent::availableFields($request);
 
@@ -89,13 +102,10 @@ trait HasConditionalContainer
          * Exclude all instance of conditional container from index views
          */
         if ($controller instanceof ResourceIndexController) {
-
-            return parent::availableFields($request)->filter(function ($field) {
-
-                return !($field instanceof ConditionalContainer);
-
-            });
-
+            return parent::availableFields($request)
+                ->filter(function ($field) {
+                    return !($field instanceof ConditionalContainer);
+                });
         }
 
         if ($controller instanceof CreationFieldController ||
@@ -103,9 +113,27 @@ trait HasConditionalContainer
 
             $fields = parent::availableFields($request);
             $containers = $this->findAllContainers($fields);
-            $expressionsMap = $containers->flatMap->expressions->map(function ($expression) {
-                return is_callable($expression) ? $expression() : $expression;
-            });
+
+            $flexibleFields = $this->findAllFlexibleContentFields($fields);
+            $expressionsMap = $containers->flatMap->expressions;
+
+            if ($flexibleFields->isNotEmpty()) {
+                $clonedFlexibleFields = $this->injectMetaIntoFields(
+                    $flexibleFields,
+                    $expressionsMap
+                );
+
+                foreach ($fields as $index => $field) {
+                    $match = $clonedFlexibleFields->firstWhere(
+                        'attribute',
+                        $field->attribute
+                    );
+
+                    if ($field instanceof Flexible && $match) {
+                        $fields->put($index, $match);
+                    }
+                }
+            }
 
             $cleanUpMethodName = $controller instanceof UpdateFieldController ?
                 'removeNonUpdateFields' :
@@ -115,9 +143,13 @@ trait HasConditionalContainer
              * @var ConditionalContainer $container
              */
             foreach ($containers as $container) {
-
                 $container->fields = $this->$cleanUpMethodName(
-                    $request, new FieldCollection($this->filter($container->fields->toArray()))
+                    $request,
+                    new FieldCollection(
+                        $this->filter(
+                            $container->fields->toArray()
+                        )
+                    )
                 )->values();
 
                 /**
@@ -125,56 +157,220 @@ trait HasConditionalContainer
                  * each container has an overall knowledge of what fields it should build up the listeners
                  */
                 $container->withMeta([ 'expressionsMap' => $expressionsMap ]);
-
             }
 
             return $this->preloadRelationships($expressionsMap, $fields);
-
         }
 
         /**
          * Whats is this controller for? seems to be executed when there is a BelongsToMany Field
          */
         if ($controller instanceof ActionController) {
-
             return parent::availableFields($request);
-
         }
 
         $method = $this->fieldsMethod($request);
         $allFields = $this->{$method}($request);
+
         $containers = $this->findAllContainers($allFields);
-        $expressionsMap = $containers->flatMap->expressions->map(function ($expression) {
-            return is_callable($expression) ? $expression() : $expression;
-        });
+        $expressionsMap = $containers->flatMap->expressions;
+
+        $flexibleContent = $this->findAllFlexibleContentFields($allFields);
+
+        if ($flexibleContent->isNotEmpty()) {
+            $this->registerFlexibleMacros($request, $flexibleContent);
+        }
 
         $fields = $this->flattenDependencies(
-            $request, $this->preloadRelationships($expressionsMap, $allFields)
+            $request,
+            $this->preloadRelationships($expressionsMap, $allFields)
         );
 
-        return new FieldCollection(array_values($this->filter($fields->toArray())));
+        return new FieldCollection(
+            array_values(
+                $this->filter(
+                    $fields->toArray()
+                )
+            )
+        );
+    }
 
+    private function injectMetaIntoFields(
+        Collection $flexibleContents,
+        Collection $expressionsMap
+    ): Collection {
+        return $flexibleContents->map(
+            function (Flexible $flexible) use ($expressionsMap) {
+                $clone = new Flexible(
+                    $flexible->name,
+                    $flexible->attribute,
+                    $flexible->resolveCallback
+                );
+
+                $flexible->meta['layouts']
+                    ->map(function (Layout $field) use ($expressionsMap) {
+                        $fields = collect($field->fields())
+                            ->map(function ($field) use ($expressionsMap) {
+                                if ($field instanceof ConditionalContainer) {
+                                    $field->withMeta([
+                                        '__uses_flexible_field__' => true
+                                    ]);
+                                    $field->withMeta([
+                                        'expressionsMap' => $expressionsMap
+                                    ]);
+
+                                    $field->fields->each(function ($field) {
+                                        if (method_exists($field, 'withMeta')) {
+                                            $field->withMeta([
+                                                '__has_flexible_field__' => true
+                                            ]);
+                                        }
+                                    });
+                                }
+
+                                return $field;
+                            });
+
+                        return new $field(
+                            $field->title(),
+                            $field->name(),
+                            $fields,
+                            $field->key(),
+                            $field->getAttributes()
+                        );
+                    })
+                    ->each(function (Layout $layout) use ($clone) {
+                        $clone->addLayout($layout);
+                    });
+
+                return $clone;
+            }
+        );
+    }
+
+    private function registerFlexibleMacros(
+        NovaRequest $request,
+        Collection $flexibleContent
+    ) {
+        $fakeRequest = $request;
+
+        foreach ($flexibleContent as $field) {
+            $field::macro('generateFieldName', function (array $fields) {
+                return collect($fields)->pluck('attribute')->join('.');
+            });
+
+            $field::macro(
+                'resolveFlexibleGroups',
+                function ($flattenDependencies) use ($fakeRequest) {
+                    return $this->groups->filter()
+                        ->map(function (Layout $layout) use ($flattenDependencies, $fakeRequest) {
+                            $fields = $flattenDependencies(
+                                $fakeRequest,
+                                $layout->fields(),
+                                $layout->attributesToArray()
+                            )->map(function ($field) {
+                                return clone $field;
+                            });
+
+                            $name = $this->generateFieldName(
+                                $fields->toArray()
+                            );
+
+                            return new Layout(
+                                $layout->title(),
+                                $name,
+                                $fields,
+                                $layout->key(),
+                                $layout->getAttributes()
+                            );
+                        });
+                }
+            );
+
+            $field::macro(
+                'resolveForValidation',
+                function ($flattenDependencies, Flexible $field) use ($fakeRequest) {
+                    $this->groups = collect();
+                    $this->syncAndFillGroups($fakeRequest, $this->attribute);
+                    $this->groups = $this->resolveFlexibleGroups(
+                        $flattenDependencies
+                    );
+                    $bag = collect($fakeRequest->input($this->attribute))
+                        ->keyBy('key');
+
+                    foreach ($this->groups as $group) {
+                        $key = $group->key();
+                        $currentValue = $bag->get($key);
+
+                        $bag->offsetSet(
+                            $group->key(),
+                            array_merge($currentValue, ['layout' => $group->name()])
+                        );
+                    }
+
+                    $fakeRequest->merge([
+                        $this->attribute => $bag->values()->toArray()
+                    ]);
+
+                    $this->layouts = LayoutCollection::make($this->groups);
+                }
+            );
+
+            $field::macro(
+                'resolveConditionalContainer',
+                function ($flattenDependencies) use ($fakeRequest) {
+                    $groups = $this->resolveFlexibleGroups($flattenDependencies);
+
+                    $layouts = LayoutCollection::make($groups)
+                        ->map(function (Layout $layout) {
+                            $name = $this->generateFieldName($layout->fields());
+                            $layout->setAttribute('__conditional_name__', $name);
+
+                            return new Layout(
+                                $layout->title(),
+                                $name,
+                                $layout->fields(),
+                                $layout->key(),
+                                $layout->getAttributes()
+                            );
+                        })
+                        ->unique('__conditional_name__');
+
+                    $value = $this->resolveGroups($groups)
+                        ->map(function (array $layout) {
+                            $layout['layout'] = $this->generateFieldName(
+                                $layout['attributes']
+                            );
+
+                            return $layout;
+                        });
+
+                    $this->withMeta([
+                        'value' => $value->values()
+                    ]);
+                    $this->withMeta([
+                        'layouts' => $layouts->values()
+                    ]);
+                }
+            );
+       }
     }
 
     private function preloadRelationships(Collection $expressionsMap, $fields)
     {
-
         $relations = collect();
 
         foreach ($fields as $field) {
-
             if ($field instanceof RelatableField ||
-                $field instanceof \NovaAttachMany\AttachMany ||
-                $field instanceof \Benjacho\BelongsToManyField\BelongsToManyField) {
-
+                $field instanceof AttachMany ||
+                $field instanceof BelongsToManyField
+            ) {
                 $relations->push($field->attribute);
-
             }
-
         }
 
         $expressionsMap = $expressionsMap->map(function (string $expression) {
-            return ConditionalContainer::splitLiteral($expression)[ 0 ];
+            return ConditionalContainer::splitLiteral($expression)[0];
         });
 
         /**
@@ -185,81 +381,109 @@ trait HasConditionalContainer
         });
 
         if ($relations->isNotEmpty()) {
-
             $this->loadMissing($relations);
-
         }
 
         return $fields;
-
     }
 
-    private function flattenDependencies(NovaRequest $request, array $fields)
-    {
-
+    private function flattenDependencies(
+        NovaRequest $request,
+        array $fields,
+        array $resource = null
+    ) {
         $controller = $request->route()->controller;
         $fields = collect($fields);
+        $resource = is_array($resource) ? collect($resource) : $this;
 
         if ($fields->whereInstanceOf(ConditionalContainer::class)->isEmpty() &&
-            $fields->whereInstanceOf(MergeValue::class)->isEmpty()) {
-
+            $fields->whereInstanceOf(MergeValue::class)->isEmpty() &&
+            $fields->whereInstanceOf(Flexible::class)->isEmpty()
+        ) {
             return $fields;
-
         }
 
         $fakeRequest = $request->duplicate();
 
-        return $fields->flatMap(function ($field) use ($fields, $fakeRequest, $controller) {
-
-            if ($field instanceof Field) {
-
-                $this->parseThirdPartyPackageFieldValue($field, $fakeRequest);
-
-            }
-
-            if ($field instanceof ConditionalContainer) {
-
-                $field->fields->each(function ($container) use ($field) {
-                    $container->panel = $field->panel;
-                });
-
-                /*
-                 * If instance of any associative type flatten out all the fields
-                 */
-                if (
-                    $controller instanceof AssociatableController ||
-                    $controller instanceof AttachableController ||
-                    $controller instanceof MorphableController ||
-                    $controller instanceof ResourceAttachController ||
-                    $controller instanceof FieldController) {
-
-                    return $this->flattenDependencies($fakeRequest, $field->fields->toArray());
-
+        return $fields->flatMap(
+            function ($field) use ($fields, $fakeRequest, $controller) {
+                if ($field instanceof Field) {
+                    $this->parseThirdPartyPackageFieldValue(
+                        $field,
+                        $fakeRequest
+                    );
                 }
 
-                if ($controller instanceof ResourceUpdateController ||
-                    $controller instanceof ResourceStoreController) {
+                if ($field instanceof Flexible) {
+                    if ($controller instanceof ResourceUpdateController) {
+//                        $field->resolveForValidation(
+//                            Closure::fromCallable(
+//                                [$this, 'flattenDependencies'],
+//                                $field
+//                            )
+//                        );
+                    } else {
+                        $field->resolve($this);
+                        $field->resolveConditionalContainer(
+                            Closure::fromCallable(
+                                [$this, 'flattenDependencies']
+                            )
+                        );
+                    }
+
+                    return [$field];
+                }
+
+                if ($field instanceof ConditionalContainer) {
+                    $field->fields->each(function ($container) use ($field) {
+                        $container->panel = $field->panel;
+                    });
+
+                    /*
+                     * If instance of any associative type flatten out all the
+                     * fields
+                     */
+                    if (
+                        $controller instanceof AssociatableController ||
+                        $controller instanceof AttachableController ||
+                        $controller instanceof MorphableController ||
+                        $controller instanceof ResourceAttachController ||
+                        $controller instanceof FieldController
+                    ) {
+                        return $this->flattenDependencies(
+                            $fakeRequest,
+                            $field->fields->toArray()
+                        );
+                    }
+
+                    if ($controller instanceof ResourceUpdateController ||
+                        $controller instanceof ResourceStoreController
+                    ) {
+                        return $this->flattenDependencies(
+                            $fakeRequest,
+                            $field->resolveDependencyFieldUsingRequest(
+                                $this,
+                                $fakeRequest
+                            )
+                        );
+                    }
 
                     return $this->flattenDependencies(
-                        $fakeRequest, $field->resolveDependencyFieldUsingRequest($this, $fakeRequest)
+                        $fakeRequest,
+                        $field->resolveDependencyFieldUsingResource($this)
                     );
-
                 }
 
-                return $this->flattenDependencies($fakeRequest, $field->resolveDependencyFieldUsingResource($this));
+                if ($field instanceof MergeValue) {
+                    return $this->flattenDependencies(
+                        $fakeRequest,
+                        $field->data
+                    );
+                }
 
+                return [$field];
             }
-
-            if ($field instanceof MergeValue) {
-
-                return $this->flattenDependencies($fakeRequest, $field->data);
-
-            }
-
-            return [ $field ];
-
-        });
-
+        );
     }
 
     /**
@@ -268,72 +492,90 @@ trait HasConditionalContainer
      * @param Field $field
      * @param NovaRequest $request
      */
-    private function parseThirdPartyPackageFieldValue(Field $field, NovaRequest $request)
-    {
-
+    private function parseThirdPartyPackageFieldValue(
+        Field $field,
+        NovaRequest $request
+    ) {
         $value = $request->get($field->attribute);
 
-        if ($field instanceof \Benjacho\BelongsToManyField\BelongsToManyField) {
-
+        if ($field instanceof BelongsToManyField) {
             $request->offsetSet(
-                $field->attribute, collect(json_decode($value, true))->map->id
+                $field->attribute,
+                collect(json_decode($value, true))->map->id
             );
-
         }
 
-        if ($field instanceof \NovaAttachMany\AttachMany) {
-
+        if ($field instanceof AttachMany) {
             $request->offsetSet(
-                $field->attribute, collect(json_decode($value, true))
+                $field->attribute,
+                collect(json_decode($value, true))
             );
-
         }
-
     }
 
-    private function findAllActiveContainers(Collection $fields, $resource): Collection
-    {
+    private function findAllActiveContainers(
+        Collection $fields, $resource
+    ): Collection {
         return $this->findAllContainers($fields)
                     ->filter(function ($container) use ($resource) {
-                        return $container->runConditions(collect($resource->toArray()));
+                        return $container->runConditions(
+                            collect($resource->toArray())
+                        );
                     })
                     ->values();
+    }
+
+    private function findAllFlexibleContentFields(
+        $fields
+    ): Collection {
+        return collect($fields)->flatMap(function ($field) {
+            if ($field instanceof Flexible) {
+                return $this->findAllFlexibleContentFields(
+                    $field->meta['layouts']->flatMap->fields()
+                )->concat([$field]);
+            }
+
+            if ($field instanceof MergeValue) {
+                return $this->findAllFlexibleContentFields($field->data);
+            }
+
+            if ($field instanceof ConditionalContainer) {
+                return $this->findAllFlexibleContentFields($field->fields);
+            }
+        })
+            ->filter();
     }
 
     private function findAllContainers($fields): Collection
     {
         return collect($fields)
             ->flatMap(function ($field) {
-
                 if ($field instanceof ConditionalContainer) {
-
-                    return $this->findAllContainers($field->fields)->concat([ $field ]);
-
+                    return $this->findAllContainers($field->fields)
+                        ->concat([ $field ]);
                 }
 
                 if ($field instanceof MergeValue) {
-
                     return $this->findAllContainers($field->data);
-
                 }
 
+                if ($field instanceof Flexible) {
+                    return $this->findAllContainers(
+                        $field->meta['layouts']->flatMap->fields()
+                    );
+                }
             })
             ->filter()
             /**
              * Pass all meta to it's $fields
              */
             ->each(function (ConditionalContainer $conditionalContainer) {
-
-                $conditionalContainer->fields->each(function ($field) use ($conditionalContainer) {
-
-                    if (method_exists($field, 'withMeta')) {
-
-                        $field->withMeta($conditionalContainer->meta());
-
-                    }
-
-                });
-
+                $conditionalContainer->fields
+                    ->each(function ($field) use ($conditionalContainer) {
+                        if (method_exists($field, 'withMeta')) {
+                            $field->withMeta($conditionalContainer->meta());
+                        }
+                    });
             });
     }
 

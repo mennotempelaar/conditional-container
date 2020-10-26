@@ -1,5 +1,5 @@
 {
-    "name": "digital-creative/conditional-container",
+    "name": "mennotempelaar/conditional-container",
     "description": "Provides an easy way to conditionally show and hide fields in your Nova resources.",
     "keywords": [
         "laravel",
